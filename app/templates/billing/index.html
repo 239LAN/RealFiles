@@ -24,6 +24,9 @@
                 {% if current_user.vip_expire_at %}
                 <small class="text-muted">会员到期：{{ current_user.vip_expire_at.strftime('%Y-%m-%d %H:%M') }}</small>
                 {% endif %}
+                {% if current_user.queued_plan and current_user.queued_expire_at %}
+                <br><small class="text-info">当前套餐到期后转为 {{ current_user.queued_plan.display_name }}（至 {{ current_user.queued_expire_at.strftime('%Y-%m-%d %H:%M') }}），期间剩余时长不变</small>
+                {% endif %}
             </div>
         </div>
         <div class="card mb-3">

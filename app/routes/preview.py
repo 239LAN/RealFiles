@@ -102,7 +102,11 @@ def stream(file_id):
     mimetype = _guess_mime(ext)
     if ext in VIDEO_EXT or ext in AUDIO_EXT:
         return _range_response(path, mimetype)
-    return send_file(path, mimetype=mimetype)
+    resp = send_file(path, mimetype=mimetype)
+    if ext == ".svg":
+        # SVG 可内嵌脚本，内联展示时禁脚本执行，防存储型 XSS
+        resp.headers["Content-Security-Policy"] = "script-src 'none'"
+    return resp
 
 
 def _guess_mime(ext):

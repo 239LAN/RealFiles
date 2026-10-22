@@ -236,6 +236,9 @@ def parse_duration(value, unit="second") -> int:
     seconds = int(round(num * factor))
     if seconds <= 0:
         raise ValueError("时长必须大于 0")
+    # 上限 100 年：防止超大数值在 timedelta 换算时溢出导致 500
+    if seconds > 100 * 365 * 86400:
+        raise ValueError("时长超出允许范围（最长 100 年）")
     return seconds
 
 

@@ -26,6 +26,9 @@
                         {% if u.plan %}
                         {{ u.plan.display_name }}
                         {% if u.plan.name != 'free' and u.vip_expire_at %}<span class="text-muted small">至 {{ u.vip_expire_at.strftime('%Y-%m-%d') }}</span>{% endif %}
+                        {% if u.queued_plan and u.queued_expire_at %}
+                        <div class="small text-info">到期后转 {{ u.queued_plan.display_name }} 至 {{ u.queued_expire_at.strftime('%Y-%m-%d') }}</div>
+                        {% endif %}
                         {% else %}-{% endif %}
                     </div>
                     <div class="col-6"><div class="text-muted small">存储用量</div>
@@ -74,6 +77,12 @@
                     </select>
                     <button class="btn btn-sm btn-info">送叠加包</button>
                 </form>
+                {% if (u.plan and u.plan.name != 'free' and u.vip_expire_at) or u.queued_plan_id %}
+                <form method="post" action="{{ url_for('admin.revoke_plan', user_id=u.id) }}" class="mb-2"
+                      data-confirm="确定撤销 {{ u.username }} 的会员吗？将立即回落免费版并锁定容量。">
+                    <button class="btn btn-sm btn-outline-danger"><i class="bi bi-x-circle"></i> 撤销会员</button>
+                </form>
+                {% endif %}
                 <div class="d-flex gap-2">
                     <form method="post" action="{{ url_for('admin.toggle_admin', user_id=u.id) }}" class="d-inline">
                         <button class="btn btn-sm {{ 'btn-outline-danger' if u.is_admin else 'btn-outline-dark' }}">

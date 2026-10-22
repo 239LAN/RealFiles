@@ -5,6 +5,7 @@
 无心跳的 downloading 任务会被判定失败或回收。下载量受剩余容量、单文件上限与本月流量约束。
 """
 import hashlib
+import ipaddress
 import os
 import socket
 import threading
@@ -12,7 +13,9 @@ import time
 from datetime import timedelta
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import (
+    HTTPRedirectHandler, Request, build_opener,
+)
 
 from app.extensions import db
 from app.models import File, RemoteDownload, User
@@ -179,18 +182,50 @@ def _part_path(task_id: int) -> str:
     return os.path.join(current_app.config["REMOTE_TMP_ROOT"], f"rt_{task_id}.part")
 
 
+def _ip_blocked(ip) -> bool:
+    """非公网 IP 一律视为受限（回环/内网/链路本地/保留/组播/未指定）"""
+    return (ip.is_loopback or ip.is_private or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
 def _is_blocked_host(url: str) -> bool:
-    """校验下载地址：拦截 localhost 与字面回环/内网/链路本地地址，域名直接放行"""
-    import ipaddress
-    from urllib.parse import urlsplit
-    host = urlsplit(url).hostname or ""
-    if host.lower() == "localhost":
+    """校验下载地址：拦截 localhost 与回环/内网/保留地址
+
+    域名先做 DNS 解析，解析出的全部 IP 均校验，防止「域名指向内网 IP」绕过；
+    无法解析的域名一律拒绝。
+    """
+    host = (urlsplit(url).hostname or "").lower()
+    if not host or host == "localhost" or host.endswith(".localhost"):
         return True
     try:
-        ip = ipaddress.ip_address(host)
+        return _ip_blocked(ipaddress.ip_address(host))
     except ValueError:
-        return False
-    return ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError):
+        return True  # 解析失败不允许访问
+    ips = set()
+    for info in infos:
+        try:
+            ips.add(ipaddress.ip_address(info[4][0]))
+        except ValueError:
+            continue
+    if not ips:
+        return True
+    return any(_ip_blocked(ip) for ip in ips)
+
+
+class _SafeRedirectHandler(HTTPRedirectHandler):
+    """重定向时校验目标地址，防止 302 跳转到内网绕过 SSRF 防护"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _is_blocked_host(newurl):
+            raise URLError("重定向目标为受限地址，已拦截")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_SAFE_OPENER = build_opener(_SafeRedirectHandler)
 
 
 def _run_task(task_id: int):
@@ -217,7 +252,7 @@ def _run_task(task_id: int):
             raise ValueError("存储空间或本月流量不足，无法开始下载")
 
         req = Request(task.url, headers={"User-Agent": _USER_AGENT, "Accept": "*/*"})
-        conn = urlopen(req, timeout=30)  # noqa: S310 远程下载需访问任意用户给定 URL
+        conn = _SAFE_OPENER.open(req, timeout=30)  # noqa: S310 远程下载需访问任意用户给定 URL
         try:
             ctype = conn.headers.get("Content-Type", "")
             length = conn.headers.get("Content-Length")

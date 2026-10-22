@@ -73,6 +73,9 @@
                         {% if u.plan %}
                             {% if u.plan.name != 'free' and u.vip_expire_at %}{{ u.plan.display_name }}<span class="text-muted small"> 至 {{ u.vip_expire_at.strftime('%Y-%m-%d %H:%M') }}</span>{% else %}{{ u.plan.display_name }}{% endif %}
                         {% else %}-{% endif %}
+                        {% if u.queued_plan and u.queued_expire_at %}
+                            <div class="small text-info" title="当前套餐到期后自动生效">→ {{ u.queued_plan.display_name }} 至 {{ u.queued_expire_at.strftime('%Y-%m-%d') }}</div>
+                        {% endif %}
                         {% if u.storage_locked %}<span class="badge bg-danger">锁定</span>{% endif %}
                     </td>
                     <td>{% if u.is_active %}<span class="badge bg-success">正常</span>{% else %}<span class="badge bg-secondary">禁用</span>{% endif %}</td>
@@ -84,6 +87,12 @@
                         <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#balanceModal" data-id="{{ u.id }}" data-name="{{ u.username }}">改余额</button>
                         <button class="btn btn-sm btn-outline-warning" data-bs-toggle="modal" data-bs-target="#giftPlanModal" data-id="{{ u.id }}" data-name="{{ u.username }}">送会员</button>
                         <button class="btn btn-sm btn-outline-info" data-bs-toggle="modal" data-bs-target="#giftAddonModal" data-id="{{ u.id }}" data-name="{{ u.username }}">送叠加包</button>
+                        {% if (u.plan and u.plan.name != 'free' and u.vip_expire_at) or u.queued_plan_id %}
+                        <form method="post" action="{{ url_for('admin.revoke_plan', user_id=u.id) }}" class="d-inline"
+                              data-confirm="确定撤销 {{ u.username }} 的会员吗？将立即回落免费版并锁定容量。">
+                            <button class="btn btn-sm btn-outline-danger">撤会员</button>
+                        </form>
+                        {% endif %}
                         {% if u.id != current_user.id %}
                         <form method="post" action="{{ url_for('admin.toggle_admin', user_id=u.id) }}" class="d-inline">
                             <button class="btn btn-sm {{ 'btn-outline-danger' if u.is_admin else 'btn-outline-secondary' }}">

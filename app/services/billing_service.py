@@ -61,22 +61,86 @@ def _deduct_balance(user: User, amount: Decimal, reason: str, ref_id=None):
     _add_balance_log(user.id, -amount, user.balance, reason, ref_id)
 
 
-def _plan_base(user: User, now=None):
-    """会员顺延基点：未到期则从现有到期时间续期，否则从现在开始"""
+def _plan_base(user: User, plan_id: int, now=None):
+    """会员顺延基点：同套餐未到期则从现有到期时间续期，否则从现在开始"""
     now = now or utcnow()
-    if user.vip_expire_at and user.vip_expire_at > now:
+    sync_membership(user, now)  # 先把到期的排队套餐转正，再判断同套餐续期
+    if (user.vip_expire_at and user.vip_expire_at > now
+            and user.plan_id is not None and int(user.plan_id) == int(plan_id)):
         return user.vip_expire_at
     return now
 
 
+def sync_membership(user: User, now=None) -> bool:
+    """当前套餐已到期且存在排队套餐时，排队套餐立即生效（返回是否发生切换）
+
+    VIP 期间开通 SVIP 后，原 VIP 剩余时长会排队到 SVIP 到期后继续；
+    SVIP 到期时由本函数把排队套餐转正。
+    """
+    now = now or utcnow()
+    if user.queued_plan_id is None or user.queued_expire_at is None:
+        return False
+    if user.vip_expire_at is not None and user.vip_expire_at > now:
+        return False  # 当前套餐仍在有效期内
+    if user.queued_expire_at <= now:
+        return False  # 排队套餐同样已过期，交由到期流程处理
+    user.plan_id = user.queued_plan_id
+    user.vip_expire_at = user.queued_expire_at
+    user.queued_plan_id = None
+    user.queued_expire_at = None
+    return True
+
+
+def _active_paid(user: User, now) -> bool:
+    """用户当前是否有生效中的付费套餐"""
+    return bool(
+        user.plan_id is not None and user.plan is not None
+        and user.plan.name != "free"
+        and user.vip_expire_at and user.vip_expire_at > now
+    )
+
+
 def _apply_plan(user: User, plan: MembershipPlan, expire_at, source: str):
-    """写入会员权益与开通记录（不提交事务）"""
+    """写入会员权益与开通记录（不提交事务）
+
+    expire_at 由调用方基于「同套餐续期、异套餐从现在起算」的基点算出。
+    异套餐开通时：新套餐立即生效，原套餐剩余时长顺延至新套餐到期后（期间剩余时长不变）。
+    """
+    now = utcnow()
+    sync_membership(user, now)
+    prev_plan_id = user.plan_id
+    prev_expire = user.vip_expire_at
+
+    if _active_paid(user, now) and int(prev_plan_id) != int(plan.id):
+        # 异套餐：新套餐立即生效；原套餐剩余时长排队到新套餐到期之后
+        remaining = prev_expire - now
+        # 已有排队套餐的剩余时长（相对当前套餐到期点）
+        q_remaining = timedelta(0)
+        if (user.queued_plan_id and user.queued_expire_at
+                and user.queued_expire_at > prev_expire):
+            q_remaining = user.queued_expire_at - prev_expire
+        if user.queued_plan_id is not None and int(user.queued_plan_id) == int(plan.id):
+            # 排队中的套餐与新套餐相同：排队剩余时长并入新套餐
+            expire_at = expire_at + q_remaining
+        user.queued_plan_id = prev_plan_id
+        user.queued_expire_at = expire_at + remaining
+    elif _active_paid(user, now):
+        # 同套餐续费：到期顺延；排队套餐的起始点随之后移，其剩余时长不变
+        if user.queued_plan_id and user.queued_expire_at:
+            shift = expire_at - prev_expire
+            if shift.total_seconds() > 0:
+                user.queued_expire_at = user.queued_expire_at + shift
+    else:
+        # 无生效中的付费套餐：清理可能残留的排队记录
+        user.queued_plan_id = None
+        user.queued_expire_at = None
+
     user.plan_id = plan.id
     user.vip_expire_at = expire_at
     # 开通/续费即解锁容量锁定
     user.storage_locked = False
     user.locked_at = None
-    db.session.add(UserMembership(user_id=user.id, plan_id=plan.id, start_at=utcnow(),
+    db.session.add(UserMembership(user_id=user.id, plan_id=plan.id, start_at=now,
                                   expire_at=expire_at, source=source))
 
 
@@ -95,7 +159,7 @@ def purchase_plan(user: User, plan_id: int, months: int = 1):
     amount = (Decimal(plan.monthly_price) * months).quantize(Decimal("0.01"))
     _deduct_balance(user, amount, "purchase")
 
-    expire_at = add_months(_plan_base(user), months)
+    expire_at = add_months(_plan_base(user, plan.id), months)
     _apply_plan(user, plan, expire_at, "purchase")
 
     po = PurchaseOrder(user_id=user.id, item_type="plan", item_id=plan.id,
@@ -144,8 +208,21 @@ def admin_gift_plan(user: User, plan_id: int, seconds: int):
     if seconds <= 0:
         raise BillingError("赠送时长必须大于 0")
 
-    expire_at = _plan_base(user) + timedelta(seconds=seconds)
+    expire_at = _plan_base(user, plan.id) + timedelta(seconds=seconds)
     _apply_plan(user, plan, expire_at, "admin_gift")
+    db.session.commit()
+
+
+def admin_revoke_plan(user: User):
+    """管理员撤销会员：立即回落免费版并锁定容量（与自然到期一致）"""
+    free = MembershipPlan.query.filter_by(name="free").first()
+    user.plan_id = free.id if free else None
+    user.vip_expire_at = None
+    user.queued_plan_id = None
+    user.queued_expire_at = None
+    if not user.storage_locked:
+        user.storage_locked = True
+        user.locked_at = utcnow()
     db.session.commit()
 
 
@@ -258,12 +335,21 @@ def redeem_code(user: User, code_text: str) -> str:
         raise BillingError("该兑换码已过期")
 
     now = utcnow()
+    # 原子核销：并发下仅一个请求能把 used_count 从 0 改为 1，防止一码多兑
+    claimed = (RedeemCode.query
+               .filter(RedeemCode.id == code.id, RedeemCode.used_count == 0)
+               .update({"used_count": 1, "used_at": now, "used_by": user.id},
+                       synchronize_session=False))
+    if claimed != 1:
+        db.session.rollback()
+        raise BillingError("该兑换码已被使用")
+
     if code.kind == "plan":
         plan = code.plan
         seconds = int(code.duration_seconds or 0)
         if plan is None or seconds <= 0:
             raise BillingError("兑换码内容已失效")
-        _apply_plan(user, plan, _plan_base(user, now) + timedelta(seconds=seconds), "redeem")
+        _apply_plan(user, plan, _plan_base(user, plan.id, now) + timedelta(seconds=seconds), "redeem")
         detail = f"{plan.display_name} {human_duration(seconds)}"
     elif code.kind == "balance":
         money = Decimal(code.amount or 0)
@@ -281,9 +367,6 @@ def redeem_code(user: User, code_text: str) -> str:
             remaining_bytes=pkg.amount_bytes, status="active", source="redeem"))
         detail = f"{pkg.name} {human_duration(seconds)}"
 
-    code.used_count = (code.used_count or 0) + 1
-    code.used_at = now
-    code.used_by = user.id
     db.session.add(RedeemRecord(code_id=code.id, code=code.code, user_id=user.id,
                                 kind=code.kind, detail=detail))
     db.session.commit()

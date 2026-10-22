@@ -101,6 +101,7 @@
                                 data-name="{{ p.name }}" data-count="{{ r.plan.count }}"
                                 data-need="{{ r.plan.need|human_size }}" data-avail="{{ r.plan.available|human_size }}"
                                 data-points="{{ r.plan.points }}" data-feasible="{{ 1 if r.plan.feasible else 0 }}"
+                                data-healthy="{{ 1 if p.healthy else 0 }}" data-health-err="{{ p.health_error or '' }}"
                                 {% if rows|length <= 1 %}disabled title="至少保留一个存储点"{% endif %}>删除</button>
                     </td>
                 </tr>
@@ -285,6 +286,15 @@ function openDelPoint(el) {
         btn.textContent = '删除存储点';
         text.textContent = `存储点「${d.name}」上没有文件，可直接删除。`;
         form.dataset.confirm = `确定删除存储点「${d.name}」？`;
+    } else if (d.healthy !== '1') {
+        // 源存储点连接异常：无法读取数据，转移不可行，只允许删除数据
+        document.getElementById('dp_mode').value = 'drop';
+        btn.className = 'btn btn-danger';
+        btn.textContent = '删除数据并删除';
+        text.textContent = `存储点「${d.name}」连接异常（${d.healthErr || '无法访问'}），`
+            + `其上 ${n} 个文件（合计 ${d.need}）无法读取和转移。`
+            + `删除后用户将看到「文件已丢失」提示，记录将在 7 天后自动清理。`;
+        form.dataset.confirm = `存储点无法访问，确定直接删除这 ${n} 个文件的记录？此操作不可恢复！`;
     } else if (feasible) {
         document.getElementById('dp_mode').value = 'migrate';
         btn.className = 'btn btn-primary';

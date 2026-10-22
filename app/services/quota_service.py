@@ -26,12 +26,15 @@ def _reset_month_if_needed(user: User):
 
 
 def get_plan(user: User) -> MembershipPlan:
-    """获取用户当前套餐；若会员到期则回落到免费版"""
+    """获取用户当前套餐；会员到期时有排队套餐则自动转正，否则回落到免费版"""
     from app.models import MembershipPlan
     free = MembershipPlan.query.filter_by(name="free").first()
     if user.plan is None:
         return free
     if user.vip_expire_at is not None and user.vip_expire_at < utcnow():
+        from app.services import billing_service
+        if billing_service.sync_membership(user):
+            return user.plan  # 排队套餐（如顺延的 VIP）即时生效
         return free
     return user.plan
 

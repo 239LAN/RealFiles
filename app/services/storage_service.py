@@ -928,6 +928,9 @@ def transfer_plan(point, files) -> dict:
 def transfer_object(src_point, dst_point, storage_key: str):
     """把单个文件实体从 src_point 搬到 dst_point"""
     local = read_path(src_point, storage_key)
+    if not os.path.exists(local):
+        # 源实体缺失：抛 StorageError 让上层按失败计数处理，而非 500
+        raise StorageError(f"源文件实体缺失：{storage_key}")
     write_from_path(dst_point, storage_key, local, move=True)
 
 

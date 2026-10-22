@@ -35,6 +35,10 @@ class User(UserMixin, db.Model):
     # 会员状态
     plan_id = db.Column(db.Integer, db.ForeignKey("membership_plans.id"), nullable=True)
     vip_expire_at = db.Column(db.DateTime, nullable=True)
+    # 排队会员：当前套餐到期后生效（如 VIP 期间开通 SVIP，SVIP 立即生效，
+    # 原 VIP 剩余时长顺延至 SVIP 到期后继续，顺延期间剩余时长不变）
+    queued_plan_id = db.Column(db.Integer, db.ForeignKey("membership_plans.id"), nullable=True)
+    queued_expire_at = db.Column(db.DateTime, nullable=True)
     # 到期锁定（容量到期后禁止上传/下载）
     storage_locked = db.Column(db.Boolean, default=False, nullable=False)
     locked_at = db.Column(db.DateTime, nullable=True)
@@ -46,15 +50,13 @@ class User(UserMixin, db.Model):
 
     files = db.relationship("File", backref="owner", lazy="dynamic")
     plan = db.relationship("MembershipPlan", foreign_keys=[plan_id])
+    queued_plan = db.relationship("MembershipPlan", foreign_keys=[queued_plan_id])
 
     def set_password(self, raw: str):
         self.password_hash = generate_password_hash(raw)
 
     def check_password(self, raw: str) -> bool:
         return check_password_hash(self.password_hash, raw)
-
-    def is_vip_or_svip(self) -> bool:
-        return self.plan is not None and self.plan.name in ("vip", "svip")
 
 
 class MembershipPlan(db.Model):

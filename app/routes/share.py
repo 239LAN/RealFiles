@@ -48,6 +48,14 @@ def _lock_state(token: str):
 
 
 def _record_fail(token: str):
+    # 表容量上限：防止大量 (token, ip) 组合造成内存膨胀
+    if len(_pwd_guard) >= 10000:
+        now0 = utcnow().timestamp()
+        for k in [k for k, v in _pwd_guard.items()
+                  if now0 - v[1] > PWD_LOCK_SECONDS]:
+            _pwd_guard.pop(k, None)
+        if len(_pwd_guard) >= 10000:
+            _pwd_guard.clear()
     key = (token, request.remote_addr or "")
     now = utcnow().timestamp()
     rec = _pwd_guard.get(key) or [0, now]
@@ -134,12 +142,16 @@ def create():
             days = int(expire_days)
         except (TypeError, ValueError):
             abort(400, "有效期必须是整数天")
+        if days <= 0:
+            abort(400, "有效期必须大于 0 天")
         link.expire_at = utcnow() + timedelta(days=days)
     if max_downloads:
         try:
             link.max_downloads = int(max_downloads)
         except (TypeError, ValueError):
             abort(400, "下载次数必须是整数")
+        if link.max_downloads <= 0:
+            abort(400, "下载次数必须大于 0")
 
     db.session.add(link)
     db.session.commit()
@@ -450,6 +462,8 @@ def direct_create():
             days = int(expire_days)
         except (TypeError, ValueError):
             abort(400, "有效期必须是整数天")
+        if days <= 0:
+            abort(400, "有效期必须大于 0 天")
         link.expire_at = utcnow() + timedelta(days=days)
     db.session.add(link)
     _direct_consume_create(owner.id)  # 与上面的 add 同一次提交落库

@@ -3,10 +3,10 @@ import threading
 from datetime import timedelta
 
 from app.extensions import db
-from app.models import User, MembershipPlan, UserAddon
-from app.services import file_service, storage_service, update_service
+from app.models import User, MembershipPlan, UserAddon, UploadSession
+from app.services import billing_service, file_service, storage_service, update_service
 from app.utils.helpers import utcnow
-from config import env_get
+from config import Config, env_get
 
 
 def reset_monthly_traffic():
@@ -21,17 +21,22 @@ def reset_monthly_traffic():
 
 
 def expire_memberships():
-    """会员到期：回落到免费版并锁定容量"""
+    """会员到期：有排队套餐（如 VIP 顺延至 SVIP 到期后）则转正；彻底到期的回落免费版并锁定容量"""
     now = utcnow()
     users = User.query.filter(User.vip_expire_at.is_not(None)).all()
     free = MembershipPlan.query.filter_by(name="free").first()
     for u in users:
-        if u.vip_expire_at < now:
-            u.plan_id = free.id if free else None
-            u.vip_expire_at = None
-            if not u.storage_locked:
-                u.storage_locked = True
-                u.locked_at = now
+        if u.vip_expire_at >= now:
+            continue
+        if billing_service.sync_membership(u, now):
+            continue  # 排队套餐转正，不回落不锁定
+        u.plan_id = free.id if free else None
+        u.vip_expire_at = None
+        u.queued_plan_id = None
+        u.queued_expire_at = None
+        if not u.storage_locked:
+            u.storage_locked = True
+            u.locked_at = now
     db.session.commit()
 
 
@@ -79,6 +84,24 @@ def purge_lost_files():
     storage_service.purge_lost_records()
 
 
+def purge_upload_sessions():
+    """清理超期的分片上传会话及其临时分片目录，避免磁盘与表数据残留"""
+    import os
+    import shutil
+
+    threshold = utcnow() - timedelta(seconds=Config.UPLOAD_SESSION_TTL)
+    stale = UploadSession.query.filter(UploadSession.created_at < threshold).all()
+    for s in stale:
+        tmp_dir = os.path.join(Config.UPLOAD_TMP_ROOT, s.upload_id)
+        try:
+            if os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        except OSError:
+            pass
+        db.session.delete(s)
+    db.session.commit()
+
+
 def run_all():
     reset_monthly_traffic()
     expire_memberships()
@@ -87,6 +110,7 @@ def run_all():
     clean_storage_cache()
     check_storage_health()
     purge_lost_files()
+    purge_upload_sessions()
 
 
 def check_update():

@@ -96,6 +96,7 @@ def create_app(config_class=Config):
         db.create_all()
         _migrate_addon_duration()
         _migrate_storage_points()
+        _migrate_user_membership_queue()
         _seed_plans()
         _seed_storage_points()
         _drop_legacy_speed_limit()
@@ -201,6 +202,25 @@ def _migrate_storage_points():
             with db.engine.begin() as conn:
                 conn.execute(text(
                     "ALTER TABLE remote_downloads ADD COLUMN storage_id INTEGER"))
+
+
+def _migrate_user_membership_queue():
+    """升级兼容：为用户补充排队会员列（VIP 顺延至 SVIP 到期后生效）"""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(db.engine)
+    if "users" not in inspector.get_table_names():
+        return
+    columns = {c["name"] for c in inspector.get_columns("users")}
+    stmts = []
+    if "queued_plan_id" not in columns:
+        stmts.append("ALTER TABLE users ADD COLUMN queued_plan_id INTEGER")
+    if "queued_expire_at" not in columns:
+        stmts.append("ALTER TABLE users ADD COLUMN queued_expire_at DATETIME")
+    if stmts:
+        with db.engine.begin() as conn:
+            for sql in stmts:
+                conn.execute(text(sql))
 
 
 def _seed_storage_points():

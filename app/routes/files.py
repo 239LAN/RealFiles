@@ -521,8 +521,13 @@ def upload_init():
     owner = current_file_owner()
     data = request.get_json() or {}
     raw_name = data.get("filename") or ""
-    total_size = int(data.get("total_size") or 0)
-    chunk_size = int(data.get("chunk_size") or current_app.config["CHUNK_SIZE"])
+    try:
+        total_size = int(data.get("total_size") or 0)
+        chunk_size = int(data.get("chunk_size") or current_app.config["CHUNK_SIZE"])
+    except (TypeError, ValueError):
+        return jsonify(error="参数错误"), 400
+    # 分片大小夹取在 64KB ~ 64MB，防止过小刷爆会话表或过大撑爆内存/磁盘
+    chunk_size = max(64 * 1024, min(chunk_size, 64 * 1024 * 1024))
     md5 = data.get("md5")
     parent_id = data.get("parent_id") or None
 
@@ -571,18 +576,31 @@ def upload_init():
 def upload_chunk():
     owner = current_file_owner()
     upload_id = request.form.get("upload_id")
-    index = int(request.form.get("index"))
+    try:
+        index = int(request.form.get("index"))
+    except (TypeError, ValueError):
+        return jsonify(error="分片索引不正确"), 400
     chunk = request.files.get("chunk")
     sess = UploadSession.query.filter_by(upload_id=upload_id, user_id=owner.id).first()
     if sess is None or sess.status != "uploading":
         return jsonify(error="上传会话无效"), 400
     if chunk is None:
         return jsonify(error="缺少分片"), 400
+    expected = -(-sess.total_size // sess.chunk_size)  # 向上取整的总片数
+    if not 0 <= index < expected:
+        return jsonify(error="分片索引超出范围"), 400
 
     tmp_dir = os.path.join(current_app.config["UPLOAD_TMP_ROOT"], upload_id)
     os.makedirs(tmp_dir, exist_ok=True)
     chunk_path = os.path.join(tmp_dir, f"{index}.part")
     chunk.save(chunk_path)
+    # 单个分片不允许超过声明的 chunk_size，防止绕过配额/流量校验
+    if os.path.getsize(chunk_path) > sess.chunk_size:
+        try:
+            os.remove(chunk_path)
+        except OSError:
+            pass
+        return jsonify(error="分片大小超过限制"), 400
 
     received = set(sess.received_chunks.split(",")) if sess.received_chunks else set()
     received.add(str(index))
@@ -602,13 +620,29 @@ def upload_complete():
         return jsonify(error="上传会话无效"), 400
 
     tmp_dir = os.path.join(current_app.config["UPLOAD_TMP_ROOT"], upload_id)
+    # 校验分片完整性：缺片直接合并会得到损坏文件
+    received = sorted([int(i) for i in sess.received_chunks.split(",") if i])
+    expected = -(-sess.total_size // sess.chunk_size)
+    if received != list(range(expected)):
+        return jsonify(error=f"分片不完整（已收 {len(received)}/{expected}），请补传后再完成"), 400
+
     merged = os.path.join(tmp_dir, "merged")
     with open(merged, "wb") as out:
-        received = sorted([int(i) for i in sess.received_chunks.split(",") if i])
         for i in received:
             p = os.path.join(tmp_dir, f"{i}.part")
+            if not os.path.exists(p):
+                out.close()
+                try:
+                    os.remove(merged)
+                except OSError:
+                    pass
+                return jsonify(error=f"分片 {i} 文件缺失，请重新上传该分片"), 400
             with open(p, "rb") as fh:
                 shutil_copyfileobj(fh, out)
+    if os.path.getsize(merged) != sess.total_size:
+        shutil_rmtree(tmp_dir)
+        db.session.rollback()
+        return jsonify(error="合并后文件大小与声明不符，请重新上传"), 400
 
     try:
         f = file_service.save_chunked_file(

@@ -30,8 +30,17 @@ CODE_PAGE_SIZE = 200
 
 
 def _guard_redirect():
-    """管理页统一回跳目标"""
-    return request.referrer or url_for("admin.users_page")
+    """管理页统一回跳目标（仅允许站内地址，防开放重定向）"""
+    from urllib.parse import urlsplit
+    ref = request.referrer or ""
+    if ref:
+        try:
+            parts = urlsplit(ref)
+            if not parts.netloc or parts.netloc == request.host:
+                return ref
+        except ValueError:
+            pass
+    return url_for("admin.users_page")
 
 
 @admin_bp.before_request
@@ -45,25 +54,27 @@ def _guard():
 
 def _dashboard_stats():
     now = utcnow()
-    users = User.query.all()
-    files = File.query.all()
-
     plan_ids = {p.id for p in MembershipPlan.query.all()}
     dist = {}
-    for u in users:
-        dist.setdefault(u.plan_id if u.plan_id in plan_ids else None, 0)
-        dist[u.plan_id if u.plan_id in plan_ids else None] += 1
+    for plan_id, cnt in db.session.query(User.plan_id, db.func.count()).group_by(User.plan_id).all():
+        dist[plan_id if plan_id in plan_ids else None] = cnt
+
+    storage_used, file_count = db.session.query(
+        db.func.coalesce(db.func.sum(File.size), 0), db.func.count(File.id)
+    ).filter(File.is_dir == False).first()  # noqa: E712
 
     return {
-        "total_users": len(users),
-        "active_users": sum(1 for u in users if u.is_active),
-        "admin_users": sum(1 for u in users if u.is_admin),
-        "disabled_users": sum(1 for u in users if not u.is_active),
-        "locked_users": sum(1 for u in users if u.storage_locked),
-        "expiring_soon": sum(1 for u in users if u.vip_expire_at and now < u.vip_expire_at <= now + timedelta(days=7)),
-        "storage_used": sum(f.size for f in files if not f.is_dir),
-        "file_count": sum(1 for f in files if not f.is_dir),
-        "dir_count": sum(1 for f in files if f.is_dir),
+        "total_users": User.query.count(),
+        "active_users": User.query.filter_by(is_active=True).count(),
+        "admin_users": User.query.filter_by(is_admin=True).count(),
+        "disabled_users": User.query.filter_by(is_active=False).count(),
+        "locked_users": User.query.filter_by(storage_locked=True).count(),
+        "expiring_soon": User.query.filter(
+            User.vip_expire_at > now,
+            User.vip_expire_at <= now + timedelta(days=7)).count(),
+        "storage_used": int(storage_used),
+        "file_count": file_count,
+        "dir_count": File.query.filter_by(is_dir=True).count(),
         "share_count": ShareLink.query.count(),
         "plan_dist": dist,
         "recharge_today": db.session.query(db.func.coalesce(db.func.sum(BalanceLog.change), 0))
@@ -125,6 +136,8 @@ def user_detail(user_id):
 @admin_bp.route("/user/<int:user_id>/balance", methods=["POST"])
 def adjust_balance(user_id):
     user = db.session.get(User, user_id)
+    if user is None:
+        abort(404)
     delta = request.form.get("delta")
     note = request.form.get("note") or ""
     try:
@@ -140,6 +153,8 @@ def adjust_balance(user_id):
 def gift_plan(user_id):
     """赠送会员：精确到秒，可自定义单位"""
     user = db.session.get(User, user_id)
+    if user is None:
+        abort(404)
     plan_id = request.form.get("plan_id")
     try:
         seconds = parse_duration(request.form.get("duration_value"),
@@ -152,9 +167,26 @@ def gift_plan(user_id):
     return redirect(_guard_redirect())
 
 
+@admin_bp.route("/user/<int:user_id>/revoke_plan", methods=["POST"])
+def revoke_plan(user_id):
+    """撤销会员：立即回落免费版并锁定容量（与自然到期一致）"""
+    user = db.session.get(User, user_id)
+    if user is None:
+        abort(404)
+    try:
+        billing_service.admin_revoke_plan(user)
+        flash(f"已撤销 {user.username} 的会员", "success")
+    except Exception as e:  # noqa: BLE001
+        db.session.rollback()
+        flash(f"撤销失败：{e}", "danger")
+    return redirect(_guard_redirect())
+
+
 @admin_bp.route("/user/<int:user_id>/gift_addon", methods=["POST"])
 def gift_addon(user_id):
     user = db.session.get(User, user_id)
+    if user is None:
+        abort(404)
     package_id = request.form.get("package_id")
     try:
         billing_service.admin_gift_addon(user, int(package_id))
@@ -168,6 +200,8 @@ def gift_addon(user_id):
 @admin_bp.route("/user/<int:user_id>/toggle", methods=["POST"])
 def toggle_user(user_id):
     user = db.session.get(User, user_id)
+    if user is None:
+        abort(404)
     if user.id != current_user.id:
         user.is_active = not user.is_active
         db.session.commit()
@@ -630,8 +664,12 @@ def storage_delete(point_id):
 
     mode = (request.form.get("mode") or "migrate").strip()
     plan = storage_service.delete_plan(point)
+    # 源存储点不可访问时无法读取/转移数据，探测一次以决定可行路径
+    src_err = storage_service.test_connection(point) if plan["count"] else ""
     try:
         if mode == "migrate":
+            if src_err:
+                raise ValueError(f"存储点无法连接（{src_err}），无法转移数据，请选择删除数据")
             if plan["count"] and not plan["feasible"]:
                 raise ValueError(
                     f"其他存储点可用空间不足（需 {plan['need']} 字节，可用 {plan['available']} 字节），"
@@ -641,7 +679,8 @@ def storage_delete(point_id):
             db.session.commit()
             flash(f"已转移 {moved} 个文件到其他存储点，存储点「{point.name}」已删除", "success")
         else:
-            if plan["count"] and plan["feasible"]:
+            # 源点可访问且其他点空间充足时必须先转移；源点不可访问时允许直接删除数据
+            if plan["count"] and plan["feasible"] and not src_err:
                 raise ValueError("其他存储点空间充足，请先转移数据")
             lost = storage_service.drop_point_data(point)
             name = point.name

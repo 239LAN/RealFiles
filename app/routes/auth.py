@@ -12,6 +12,44 @@ from app.utils.helpers import safe_filename
 
 auth_bp = Blueprint("auth", __name__)
 
+# ---- 登录失败限流（进程内，按 IP） ----
+LOGIN_MAX_FAIL = 10
+LOGIN_LOCK_SECONDS = 10 * 60
+_login_guard = {}  # ip -> [fail_count, first_fail_ts]
+
+
+def _login_lock_remaining(ip: str) -> int:
+    """返回剩余锁定秒数；0 表示未锁定"""
+    from app.utils.helpers import utcnow
+    rec = _login_guard.get(ip)
+    if not rec:
+        return 0
+    cnt, first = rec
+    if cnt < LOGIN_MAX_FAIL:
+        return 0
+    remaining = LOGIN_LOCK_SECONDS - (utcnow().timestamp() - first)
+    if remaining <= 0:
+        _login_guard.pop(ip, None)
+        return 0
+    return int(remaining)
+
+
+def _record_login_fail(ip: str):
+    from app.utils.helpers import utcnow
+    # 表容量上限，防止大量不同 IP 造成内存膨胀
+    if len(_login_guard) >= 10000:
+        now0 = utcnow().timestamp()
+        for k in [k for k, v in _login_guard.items()
+                  if now0 - v[1] > LOGIN_LOCK_SECONDS]:
+            _login_guard.pop(k, None)
+        if len(_login_guard) >= 10000:
+            _login_guard.clear()
+    now = utcnow().timestamp()
+    rec = _login_guard.get(ip) or [0, now]
+    rec[0] += 1
+    rec[1] = rec[1] if rec[0] > 1 else now
+    _login_guard[ip] = rec
+
 
 def _check_update_on_login(user):
     """管理员登录时后台检查一次更新（仅检查不安装，不阻塞登录、失败静默）"""
@@ -83,14 +121,21 @@ def login():
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
         agree = request.form.get("agree")
+        ip = request.remote_addr or ""
+        locked = _login_lock_remaining(ip)
+        if locked:
+            flash(f"登录失败次数过多，请 {locked // 60 + 1} 分钟后再试", "danger")
+            return render_template("auth/login.html")
         user = User.query.filter_by(username=username).first()
         if not agree:
             flash("请先阅读并同意《用户协议》《隐私政策》及《开源软件授权许可证》", "danger")
         elif user is None or not user.check_password(password):
+            _record_login_fail(ip)
             flash("用户名或密码错误", "danger")
         elif not user.is_active:
             flash("账号已被禁用", "danger")
         else:
+            _login_guard.pop(ip, None)
             login_user(user, remember=bool(request.form.get("remember")))
             session.pop("admin_view_uid", None)
             _check_update_on_login(user)
